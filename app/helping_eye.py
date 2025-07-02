@@ -6,9 +6,10 @@ from PIL import ImageDraw, ImageFont
 import torch
 from transformers import AutoModelForTokenClassification, AutoProcessor, LayoutLMv3ForTokenClassification, TrainingArguments, Trainer
 from transformers.data.data_collator import default_data_collator
+from transformers import DataCollatorForTokenClassification
 
-processor = AutoProcessor.from_pretrained("microsoft/layoutlmv3-base", apply_ocr=False)
 dataset = load_dataset("nielsr/funsd-layoutlmv3") # layoutlmv ver 3 is a model for recognizing structured objects
+processor = AutoProcessor.from_pretrained("microsoft/layoutlmv3-base", apply_ocr=False)
 features = dataset["train"].features
 column_names = dataset["train"].column_names
 image_column_name = "image"
@@ -16,95 +17,61 @@ text_column_name = "tokens"
 boxes_column_name = "bboxes"
 label_column_name = "ner_tags"
 
-training_args = TrainingArguments(output_dir="test",
-                                  max_steps=1000,
-                                  per_device_train_batch_size=2,
-                                  per_device_eval_batch_size=2,
-                                  learning_rate=1e-5,
-                                  eval_strategy="steps",
-                                  eval_steps=100,
-                                  load_best_model_at_end=True,
-                                  metric_for_best_model="f1")
-
-
 def get_label_list(labels):
-    """Creates a list of unique labels that will be used
-    to create mappings.
-    """
     unique_labels = set()
     for label in labels:
-        unique_labels |= set(label) # set union
+        unique_labels = unique_labels | set(label)
     label_list = list(unique_labels)
     label_list.sort()
     return label_list
 
-def create_mapping(list_, reverse=False):
-    """Creates mapping fron list."""
-    mapping = {k: v for k, v in enumerate(list_)}
-    return mapping
-
-# This data will be used to interpret the results.
 if isinstance(features[label_column_name].feature, ClassLabel):
-    print("YES IS INST", features[label_column_name].feature)
     label_list = features[label_column_name].feature.names
-    id2label = create_mapping(label_list)
-    label2id = create_mapping(label_list, reverse=True)
+    id2label = {k: v for k,v in enumerate(label_list)}
+    label2id = {v: k for k,v in enumerate(label_list)}
 else:
-    print("NOOOOO", features[label_column_name].feature)
-    label_list = get_label_list(dataset["train"].label_column_name)
-    id2label = create_mapping(label_list)
-    label2id = create_mapping(label_list, reverse=True)
+    label_list = get_label_list(dataset["train"][label_column_name])
+    id2label = {k: v for k,v in enumerate(label_list)}
+    label2id = {v: k for k,v in enumerate(label_list)}
 num_labels = len(label_list)
 
 def prepare_examples(examples):
-    images = examples[image_column_name]
-    words = examples[text_column_name]
-    boxes = examples[boxes_column_name]
-    word_labels = examples[label_column_name]
+  images = examples[image_column_name]
+  words = examples[text_column_name]
+  boxes = examples[boxes_column_name]
+  word_labels = examples[label_column_name]
 
-    encoding = processor(images, words, boxes=boxes, word_labels=word_labels,
-                         truncation=True, padding="max_length")
-    return encoding
+  encoding = processor(images, words, boxes=boxes, word_labels=word_labels,
+                       truncation=True, padding="max_length")
+
+  return encoding
 
 features = Features({
-    'pixel_values': Array3D(dtype='float32', shape=(3, 224, 224)),
+    'pixel_values': Array3D(dtype="float32", shape=(3, 224, 224)),
     'input_ids': Sequence(feature=Value(dtype='int64')),
     'attention_mask': Sequence(Value(dtype='int64')),
-    'bbox': Array2D(dtype='int64', shape=(512, 4)),
+    'bbox': Array2D(dtype="int64", shape=(512, 4)),
     'labels': Sequence(feature=Value(dtype='int64')),
 })
 
-def create_dataset(dataset_, features, column_names):
-    result = dataset[dataset_].map(
-        prepare_examples,
-        batched=True,
-        remove_columns=column_names,
-        features=features,
-    )
-    return result
+train_dataset = dataset["train"].map(
+    prepare_examples,
+    batched=True,
+    remove_columns=column_names,
+    features=features,
+)
+eval_dataset = dataset["test"].map(
+    prepare_examples,
+    batched=True,
+    remove_columns=column_names,
+    features=features,
+)
 
-train_dataset = dataset['train'].map(
-    prepare_examples,
-    batched=True,
-    remove_columns=column_names,
-    features=features,
-)
-eval_dataset = dataset['test'].map(
-    prepare_examples,
-    batched=True,
-    remove_columns=column_names,
-    features=features,
-)
-example = train_dataset[0]
-processor.tokenizer.decode(example['input_ids'])
 train_dataset.set_format("torch")
-#print(processor.tokenizer.decode(example['input_ids']))
-example = train_dataset[0]
-for k, v in example.items():
-    print(k, v.shape)
-
-metric = load('seqeval')
+processor.tokenizer.decode(eval_dataset[0]["input_ids"])
+metric = load("seqeval")
 return_entity_level_metrics = False
+
 def compute_metrics(p):
     predictions, labels = p
     predictions = np.argmax(predictions, axis=2)
@@ -114,10 +81,11 @@ def compute_metrics(p):
         for prediction, label in zip(predictions, labels)
     ]
     true_labels = [
-        [label_list[p] for (p, l) in zip(prediction, label) if l != -100]
+        [label_list[l] for (p, l) in zip(prediction, label) if l != -100]
         for prediction, label in zip(predictions, labels)
     ]
-    results = metric.compute(predictions=true_predictions, reference=true_labels)
+
+    results = metric.compute(predictions=true_predictions, references=true_labels)
     if return_entity_level_metrics:
         final_results = {}
         for key, value in results.items():
@@ -129,14 +97,26 @@ def compute_metrics(p):
         return final_results
     else:
         return {
-            "precision": results["overall precision"],
+            "precision": results["overall_precision"],
             "recall": results["overall_recall"],
             "f1": results["overall_f1"],
-            "accuracy": results["overall_accuract"],
+            "accuracy": results["overall_accuracy"],
         }
     
 model = LayoutLMv3ForTokenClassification.from_pretrained("microsoft/layoutlmv3-base",
-                                                         id2label=id2label, label2id=label2id)
+                                                         id2label=id2label,
+                                                         label2id=label2id)
+
+
+training_args = TrainingArguments(output_dir="test",
+                                  max_steps=50,
+                                  per_device_train_batch_size=1,
+                                  per_device_eval_batch_size=1,
+                                  learning_rate=1e-5,
+                                  eval_strategy="steps",
+                                  eval_steps=10,
+                                  load_best_model_at_end=True,
+                                  metric_for_best_model="f1")
 
 trainer = Trainer(
     model=model,
@@ -149,15 +129,17 @@ trainer = Trainer(
 )
 
 trainer.train()
-# print(trainer.evaluate())
-model = AutoModelForTokenClassification.from_pretrained("/content/test/checkpoint-1000")
+trainer.evaluate()
+
 example = dataset["test"][1]
+model = LayoutLMv3ForTokenClassification.from_pretrained("../test/checkpoint-50")
 image = example["image"]
 words = example["tokens"]
 boxes = example["bboxes"]
 word_labels = example["ner_tags"]
 
 encoding = processor(image, words, boxes=boxes, word_labels=word_labels, return_tensors="pt")
+
 with torch.no_grad():
   outputs = model(**encoding)
 
@@ -196,4 +178,17 @@ for prediction, box in zip(true_predictions, true_boxes):
     predicted_label = iob_to_label(prediction).lower()
     draw.rectangle(box, outline=label2color[predicted_label])
     draw.text((box[0] + 10, box[1] - 10), text=predicted_label, fill=label2color[predicted_label], font=font)
+
+image = example["image"]
+image = image.convert("RGB")
+
+draw = ImageDraw.Draw(image)
+
+for word, box, label in zip(example['tokens'], example['bboxes'], example['ner_tags']):
+  actual_label = iob_to_label(id2label[label]).lower()
+  box = unnormalize_box(box, width, height)
+  draw.rectangle(box, outline=label2color[actual_label], width=2)
+  draw.text((box[0] + 10, box[1] - 10), actual_label, fill=label2color[actual_label], font=font)
+
+
 print(image)
